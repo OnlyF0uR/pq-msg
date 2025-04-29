@@ -108,4 +108,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 📝 License
 
-This project is licensed under the [MIT/Apache-2.0 dual license](LICENSE).
+This project is licensed under the [MIT](LICENSE-MIT)/[Apache-2.0](LICENSE-APACHE) dual license.
