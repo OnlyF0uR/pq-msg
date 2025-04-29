@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/pq-msg.svg)](https://crates.io/crates/pq-msg)
 [![Documentation](https://docs.rs/pq-msg/badge.svg)](https://docs.rs/pq-msg)
-[![License](https://img.shields.io/crates/l/pq-msg.svg)](https://github.com/yourusername/pq-msg)
+[![License](https://img.shields.io/crates/l/pq-msg.svg)](https://github.com/OnlyF0uR/pq-msg)
 
 ## 🔒 Overview
 
