@@ -26,15 +26,40 @@ use crate::{
     signatures::keypair::{SignerPair, VerifierPair, ViewOperations},
 };
 
+/// The maximum value a nonce counter can reach before rolling over
+const MAX_NONCE_COUNTER: u64 = u64::MAX - 1;
+
+/// MessageSession manages the cryptographic state for secure message exchange
+/// between two parties using post-quantum cryptographic algorithms.
+///
+/// Each session contains:
+/// - A KEM keypair for key encapsulation mechanism
+/// - A digital signature keypair for signing messages
+/// - A shared secret established with the other party
+/// - A verifier for validating messages from the other party
+/// - A nonce for preventing replay attacks
 pub struct MessageSession {
+    /// The KEM keypair for this session
     kem_pair: pair::KEMPair,
+    /// The digital signature keypair for this session
     ds_pair: SignerPair,
+    /// The shared secret established with the other party
     shared_secret: SharedSecret,
+    /// The verifier for the other party's messages
     target_verifier: VerifierPair,
-    current_nonce: [u8; 24], // 0..16 session id, 16..24 counter (u64, 8 bytes)
+    /// The current nonce: 0..16 session id, 16..24 counter (u64, 8 bytes)
+    current_nonce: [u8; 24],
 }
 
 impl MessageSession {
+    /// Serializes the session to a byte array
+    ///
+    /// # Returns
+    /// - `Result<Vec<u8>, CryptoError>`: The serialized session or an error
+    ///
+    /// # Security Note
+    /// The serialized data contains sensitive cryptographic material including private keys.
+    /// It should be stored securely and only deserialized in a trusted environment.
     pub fn to_bytes(&self) -> Result<Vec<u8>, CryptoError> {
         let mut bytes = Vec::new();
 
@@ -55,30 +80,33 @@ impl MessageSession {
         Ok(bytes)
     }
 
+    /// Deserializes a session from a byte array
+    ///
+    /// # Arguments
+    /// * `bytes` - The serialized session bytes
+    ///
+    /// # Returns
+    /// - `Result<Self, CryptoError>`: The deserialized session or an error
+    ///
+    /// # Errors
+    /// Returns an error if the byte array is not the correct length or format
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        if bytes.len()
-            != PQCLEAN_MLKEM1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-                + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_SECRETKEYBYTES
-                + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-                + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_SECRETKEYBYTES
-                + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES
-                + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-                + 24
-        {
-            return Err(CryptoError::IncongruentLength(
-                PQCLEAN_MLKEM1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-                    + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_SECRETKEYBYTES
-                    + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-                    + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_SECRETKEYBYTES
-                    + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES
-                    + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-                    + 24,
-                bytes.len(),
-            ));
+        // Calculate expected byte length for validation
+        let expected_length = PQCLEAN_MLKEM1024_CLEAN_CRYPTO_PUBLICKEYBYTES
+            + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_SECRETKEYBYTES
+            + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
+            + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_SECRETKEYBYTES
+            + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES
+            + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
+            + 24;
+
+        if bytes.len() != expected_length {
+            return Err(CryptoError::IncongruentLength(expected_length, bytes.len()));
         }
 
         let mut idx = 0;
 
+        // Parse KEM keypair
         let kem_pair = pair::KEMPair::from_bytes_uniform(
             &bytes[idx..idx
                 + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_PUBLICKEYBYTES
@@ -88,6 +116,7 @@ impl MessageSession {
         idx += PQCLEAN_MLKEM1024_CLEAN_CRYPTO_PUBLICKEYBYTES
             + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_SECRETKEYBYTES;
 
+        // Parse DS keypair
         let ds_pair = SignerPair::from_bytes_uniform(
             &bytes[idx..idx
                 + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
@@ -97,18 +126,22 @@ impl MessageSession {
         idx += PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
             + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_SECRETKEYBYTES;
 
+        // Parse shared secret
         let ss_bytes = &bytes[idx..idx + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES];
         let shared_secret = b2ss(parse_ss(ss_bytes)?);
         idx += PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES;
 
+        // Parse target verifier
         let target_verifier = VerifierPair::from_bytes(
             &bytes[idx..idx + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES],
         )?;
         idx += PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES;
 
+        // Parse current nonce
         let current_nonce = bytes[idx..idx + 24].try_into().unwrap();
         idx += 24;
 
+        // Final validation
         if idx != bytes.len() {
             return Err(CryptoError::IncongruentLength(bytes.len(), idx));
         }
@@ -122,6 +155,18 @@ impl MessageSession {
         })
     }
 
+    /// Creates a new session as the initiator
+    ///
+    /// # Arguments
+    /// * `my_keypair` - Your own KEM keypair
+    /// * `my_signer` - Your own signer pair
+    /// * `base_nonce` - Base nonce (0..16 session id, 16..24 counter)
+    /// * `target_pubkey` - KEM public key of the target
+    /// * `target_verifier` - Falcon verifier containing the public key of the target
+    ///
+    /// # Returns
+    /// - `Result<(Self, [u8; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES]), CryptoError>`:
+    ///   The session and ciphertext for the responder, or an error
     pub fn new_initiator(
         my_keypair: KEMPair,   // This the your own keypair
         my_signer: SignerPair, // This is your own signer pair
@@ -151,11 +196,22 @@ impl MessageSession {
         ))
     }
 
+    /// Creates a new session as the responder
+    ///
+    /// # Arguments
+    /// * `my_keypair` - Your own KEM keypair
+    /// * `my_signer` - Your own signer pair
+    /// * `base_nonce` - Base nonce (0..16 session id, 16..24 counter)
+    /// * `ciphertext_bytes` - KEM ciphertext sent by the initiator
+    /// * `sender_verifier` - Falcon verifier containing the public key of the initiator
+    ///
+    /// # Returns
+    /// - `Result<Self, CryptoError>`: The session or an error
     pub fn new_responder(
         my_keypair: KEMPair,   // This the your own keypair
         my_signer: SignerPair, // This is your own signer pair
         base_nonce: [u8; 24], // 0..16 session id, 16..24 counter (u64, 8 bytes), provided by server
-        ciphertext_bytes: &[u8; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES], // KEM ciphertext semt tp us by the initiator
+        ciphertext_bytes: &[u8; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES], // KEM ciphertext sent to us by the initiator
         sender_verifier: &[u8; PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES], // Falcon verifier containing the falcon public key of the initiator
     ) -> Result<Self, CryptoError> {
         // We just have someone that attempts to establish a shared secret with us
@@ -176,45 +232,100 @@ impl MessageSession {
         })
     }
 
+    /// Creates a signed and encrypted message for the other party
+    ///
+    /// # Arguments
+    /// * `message` - The plaintext message to encrypt
+    ///
+    /// # Returns
+    /// - `Result<Vec<u8>, CryptoError>`: The encrypted message or an error
+    ///
+    /// # Security Note
+    /// This method automatically increments the nonce counter to ensure
+    /// uniqueness for each message.
     pub fn craft_message(&mut self, message: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        // Sign the message with our digital signature key
         let sig = self.ds_pair.sign(message);
 
+        // Increment the nonce for this message
         self.increment_nonce();
+
+        // Encrypt the signed message with the shared secret
         encryptor::Encryptor::new(self.shared_secret).encrypt(&sig.as_bytes(), &self.current_nonce)
     }
 
+    /// Decrypts and validates a message from the other party
+    ///
+    /// # Arguments
+    /// * `ciphertext` - The encrypted message
+    ///
+    /// # Returns
+    /// - `Result<Vec<u8>, CryptoError>`: The decrypted and validated message or an error
+    ///
+    /// # Security Note
+    /// This method automatically increments the nonce counter to match
+    /// the sender's nonce. If the nonces are out of sync, validation will fail.
     pub fn validate_message(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        // Increment the nonce to match the sender's nonce
         self.increment_nonce();
 
+        // Decrypt the message using the shared secret
         let decrypted_message = encryptor::Encryptor::new(self.shared_secret)
             .decrypt(ciphertext, &self.current_nonce)?;
 
+        // Verify that the decrypted message is large enough to contain a signature
         if decrypted_message.len() < PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_BYTES {
             return Err(CryptoError::FalconSignatureTooShort(
                 decrypted_message.len(),
             ));
         }
 
+        // Parse the signed message and verify the signature
         let sm = falconpadded1024::SignedMessage::from_bytes(&decrypted_message)?;
         let msg = self.target_verifier.verify_message(&sm)?;
 
-        // Return the crafted message object as well as the bytes of the message itself
+        // Return the verified message
         Ok(msg)
     }
 
+    /// Increments the nonce counter safely, handling overflow
+    ///
+    /// # Security Note
+    /// If the counter reaches its maximum value, it will wrap around to 0.
+    /// This is a compromise between security and usability, as the session
+    /// should ideally be refreshed before reaching this limit.
     fn increment_nonce(&mut self) {
         let mut counter = u64::from_le_bytes(self.current_nonce[16..24].try_into().unwrap());
-        counter += 1;
+
+        // Check for potential overflow
+        if counter >= MAX_NONCE_COUNTER {
+            // Reset counter to 0 when it reaches max value
+            // In a production system, you might want to regenerate the session instead
+            counter = 0;
+        } else {
+            counter += 1;
+        }
+
         self.current_nonce[16..24].copy_from_slice(&counter.to_le_bytes());
     }
 
-    // fn rollback_nonce(&mut self, n: u64) {
-    //     let mut counter = u64::from_le_bytes(self.current_nonce[16..24].try_into().unwrap());
-    //     counter -= n;
-    //     self.current_nonce[16..24].copy_from_slice(&counter.to_le_bytes());
-    // }
+    /// Gets the current nonce counter value
+    ///
+    /// # Returns
+    /// - `u64`: The current nonce counter value
+    pub fn get_counter(&self) -> u64 {
+        u64::from_le_bytes(self.current_nonce[16..24].try_into().unwrap())
+    }
 }
 
+/// Converts a ciphertext to a byte array
+///
+/// # Arguments
+/// * `ct` - The ciphertext to convert
+///
+/// # Returns
+/// - `Result<[u8; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES], CryptoError>`:
+///   The byte array or an error
 fn ct2b(
     ct: &mlkem1024::Ciphertext,
 ) -> Result<[u8; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES], CryptoError> {
@@ -231,6 +342,14 @@ fn ct2b(
     }
 }
 
+/// Parses a byte slice into a fixed-size array for a shared secret
+///
+/// # Arguments
+/// * `slice` - The byte slice to parse
+///
+/// # Returns
+/// - `Result<&[T; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES], CryptoError>`:
+///   The fixed-size array or an error
 pub fn parse_ss<T>(slice: &[T]) -> Result<&[T; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES], CryptoError> {
     if slice.len() == PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES {
         let ptr = slice.as_ptr() as *const [T; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES];
@@ -338,10 +457,6 @@ mod tests {
         let reply = b"Hello, Alice! I received your message safely.";
         let encrypted_reply = bob_session.craft_message(reply).unwrap();
 
-        // print bobs nonce
-        println!("Bob's nonce: {:?}", bob_session.current_nonce);
-        println!("Alice's nonce - 1: {:?}", alice_session.current_nonce);
-
         // // Alice decrypts and verifies Bob's reply
         let raw_reply = alice_session.validate_message(&encrypted_reply).unwrap();
 
@@ -410,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nonce_increment_and_rollback() {
+    fn test_nonce_increment_and_counter() {
         // Generate keypairs
         let kem_pair = pair::KEMPair::create();
         let ds_pair = SignerPair::create();
@@ -433,19 +548,43 @@ mod tests {
         .unwrap();
 
         // Test initial counter value
-        let counter = u64::from_le_bytes(session.current_nonce[16..24].try_into().unwrap());
+        let counter = session.get_counter();
         assert_eq!(counter, initial_counter);
 
         // Test increment_nonce
         session.increment_nonce();
-        let new_counter = u64::from_le_bytes(session.current_nonce[16..24].try_into().unwrap());
+        let new_counter = session.get_counter();
         assert_eq!(new_counter, initial_counter + 1);
+    }
 
-        // Test rollback_nonce
-        // session.rollback_nonce(1);
-        // let rolled_back_counter =
-        //     u64::from_le_bytes(session.current_nonce[16..24].try_into().unwrap());
-        // assert_eq!(rolled_back_counter, initial_counter);
+    #[test]
+    fn test_counter_wraparound() {
+        // Generate keypairs
+        let kem_pair = pair::KEMPair::create();
+        let ds_pair = SignerPair::create();
+        let target_kem_pair = pair::KEMPair::create();
+        let target_ds_pair = SignerPair::create();
+
+        // Create base nonce with counter set to MAX_NONCE_COUNTER
+        let mut base_nonce = [0u8; 24];
+        base_nonce[16..24].copy_from_slice(&MAX_NONCE_COUNTER.to_le_bytes());
+
+        // Create a session
+        let (mut session, _) = MessageSession::new_initiator(
+            kem_pair,
+            ds_pair,
+            base_nonce,
+            &target_kem_pair.to_bytes().unwrap().0,
+            &target_ds_pair.to_bytes().unwrap().0,
+        )
+        .unwrap();
+
+        // Test initial counter value
+        assert_eq!(session.get_counter(), MAX_NONCE_COUNTER);
+
+        // Test increment_nonce wraps around
+        session.increment_nonce();
+        assert_eq!(session.get_counter(), 0);
     }
 
     #[test]

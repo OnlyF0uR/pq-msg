@@ -10,11 +10,20 @@ use pqcrypto_traits::sign::{PublicKey, SecretKey, SignedMessage};
 
 use crate::errors::CryptoError;
 
+/// Type alias for a public key byte array
 pub type PublicKeyBytes = [u8; PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES];
+/// Type alias for a secret key byte array
 pub type SecretKeyBytes = [u8; PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_SECRETKEYBYTES];
 
+/// Common operations for verifying signatures
+///
+/// This trait provides methods for accessing public keys and verifying
+/// signed messages with post-quantum cryptographic algorithms.
 pub trait ViewOperations {
+    /// Gets a reference to the public key
     fn pub_key(&self) -> &falconpadded1024::PublicKey;
+
+    /// Gets a reference to the public key as a byte array
     fn pub_key_bytes(&self) -> &[u8; PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES] {
         let id = unsafe {
             &*(self.pub_key().as_bytes().as_ptr()
@@ -22,6 +31,16 @@ pub trait ViewOperations {
         };
         id
     }
+
+    /// Verifies if a signature is valid for the provided message
+    ///
+    /// # Arguments
+    /// * `msg` - The message that was signed
+    /// * `sig` - The signature to verify
+    ///
+    /// # Returns
+    /// - `Result<bool, CryptoError>`: True if signature is valid, false if invalid,
+    ///   or an error if verification couldn't be completed
     fn verify_comp(&self, msg: &[u8], sig: &[u8]) -> Result<bool, CryptoError> {
         if sig.len() != PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_BYTES + msg.len() {
             return Err(CryptoError::InvalidSignature);
@@ -40,6 +59,14 @@ pub trait ViewOperations {
         // Where v_result is the message
         Ok(v_result.unwrap() == msg)
     }
+
+    /// Verifies a signature and returns the original message bytes
+    ///
+    /// # Arguments
+    /// * `sig` - The signature bytes to verify
+    ///
+    /// # Returns
+    /// - `Result<Vec<u8>, CryptoError>`: The verified message or an error
     fn verify_message_bytes(&self, sig: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if sig.len() < PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_BYTES {
             return Err(CryptoError::InvalidSignature);
@@ -56,6 +83,14 @@ pub trait ViewOperations {
             }
         }
     }
+
+    /// Verifies a signature and returns the original message bytes
+    ///
+    /// # Arguments
+    /// * `sm` - The signed message to verify
+    ///
+    /// # Returns
+    /// - `Result<Vec<u8>, CryptoError>`: The verified message or an error
     fn verify_message(&self, sm: &falconpadded1024::SignedMessage) -> Result<Vec<u8>, CryptoError> {
         match falconpadded1024::open(&sm, self.pub_key()) {
             Ok(msg) => Ok(msg),
@@ -69,22 +104,44 @@ pub trait ViewOperations {
     }
 }
 
+/// A key pair used only for signature verification
+///
+/// This struct represents a post-quantum cryptography key pair used only
+/// for verifying signatures. It contains just the public key component.
 pub struct VerifierPair {
     pub_key: falconpadded1024::PublicKey,
 }
 
 impl VerifierPair {
+    /// Creates a new verifier pair from public key bytes
+    ///
+    /// # Arguments
+    /// * `pub_key` - The public key bytes
+    ///
+    /// # Returns
+    /// - `Result<VerifierPair, CryptoError>`: The constructed verifier or an error
     #[must_use]
     pub fn new(pub_key: &[u8]) -> Result<Self, CryptoError> {
         let pub_key = falconpadded1024::PublicKey::from_bytes(pub_key)?;
         Ok(Self { pub_key })
     }
 
+    /// Creates a new verifier pair from public key bytes (alias for new)
+    ///
+    /// # Arguments
+    /// * `pub_key` - The public key bytes
+    ///
+    /// # Returns
+    /// - `Result<VerifierPair, CryptoError>`: The constructed verifier or an error
     pub fn from_bytes(pub_key: &[u8]) -> Result<Self, CryptoError> {
         let pub_key = falconpadded1024::PublicKey::from_bytes(pub_key)?;
         Ok(Self { pub_key })
     }
 
+    /// Converts the public key to bytes
+    ///
+    /// # Returns
+    /// A vector containing the public key bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         self.pub_key.as_bytes().to_vec()
     }
@@ -96,6 +153,11 @@ impl ViewOperations for VerifierPair {
     }
 }
 
+/// A complete key pair used for both signing and verification
+///
+/// This struct represents a post-quantum cryptography key pair used for
+/// creating digital signatures and verifying them. It contains both
+/// public and secret key components using the Falcon-padded-1024 algorithm.
 #[derive(Clone)]
 pub struct SignerPair {
     pub_key: falconpadded1024::PublicKey,
@@ -103,6 +165,10 @@ pub struct SignerPair {
 }
 
 impl SignerPair {
+    /// Creates a new random signer pair
+    ///
+    /// # Returns
+    /// A new SignerPair with generated public and secret keys
     pub fn create() -> Self {
         let (pk, sk) = falconpadded1024_keypair();
         Self {
@@ -111,16 +177,36 @@ impl SignerPair {
         }
     }
 
+    /// Signs a message using this pair's secret key
+    ///
+    /// # Arguments
+    /// * `msg` - The message to sign
+    ///
+    /// # Returns
+    /// A signed message that can be verified by others
     pub fn sign(&self, msg: &[u8]) -> falconpadded1024::SignedMessage {
         falconpadded1024::sign(msg, &self.sec_key)
     }
 
+    /// Creates a signer pair from separate public and secret key bytes
+    ///
+    /// # Arguments
+    /// * `pub_key` - The public key bytes
+    /// * `sec_key` - The secret key bytes
+    ///
+    /// # Returns
+    /// - `Result<SignerPair, CryptoError>`: The constructed signer pair or an error
     pub fn from_bytes(pub_key: &[u8], sec_key: &[u8]) -> Result<Self, CryptoError> {
         let pub_key = falconpadded1024::PublicKey::from_bytes(pub_key)?;
         let sec_key = falconpadded1024::SecretKey::from_bytes(sec_key)?;
         Ok(Self { pub_key, sec_key })
     }
 
+    /// Converts the key pair to raw byte arrays
+    ///
+    /// # Returns
+    /// - `Result<([u8; PUBLICKEYBYTES], [u8; SECRETKEYBYTES]), CryptoError>`:
+    ///   A tuple containing the public and secret keys as byte arrays
     pub fn to_bytes(
         &self,
     ) -> Result<
@@ -136,6 +222,10 @@ impl SignerPair {
         ))
     }
 
+    /// Converts the key pair to a single byte vector with public key followed by secret key
+    ///
+    /// # Returns
+    /// A vector containing the concatenated public and secret key bytes
     pub fn to_bytes_uniform(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(self.pub_key.as_bytes());
@@ -143,6 +233,13 @@ impl SignerPair {
         bytes
     }
 
+    /// Creates a signer pair from a single byte slice containing both public and secret keys
+    ///
+    /// # Arguments
+    /// * `bytes` - The concatenated public and secret key bytes
+    ///
+    /// # Returns
+    /// - `Result<SignerPair, CryptoError>`: The constructed signer pair or an error
     pub fn from_bytes_uniform(bytes: &[u8]) -> Result<Self, CryptoError> {
         if bytes.len()
             != PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
