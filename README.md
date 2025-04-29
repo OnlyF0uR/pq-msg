@@ -5,7 +5,7 @@ This crate combines multiple post-quantum cryptographic techniques in order to f
 ### Contents
 The following schemes are used:
  - ML-KEM (FIPS 203): for key exchange
- - ChaCha20Poly1305: for symmetric encryption
+ - XChaCha20Poly1305: for symmetric encryption
  - Falcon (FN-DSA when standardised, FIPS 206): for message authenticity
 
 ### Attention
