@@ -1,8 +1,8 @@
 [package]
 name = "pq-msg"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
-description = "Rust crate for higher-level implementations of post-quantum messaging."
+description = "Pure Rust abstractions for higher-level implementations of post-quantum cryptography in secure messaging protocols."
 license = "MIT OR Apache-2.0"
 authors = ["OnlyF0uR"]
 homepage = "https://github.com/OnlyF0uR/pq-msg"
