@@ -16,6 +16,7 @@ use pqcrypto_mlkem::{
 };
 use pqcrypto_traits::kem::{Ciphertext, PublicKey};
 use pqcrypto_traits::sign::SignedMessage;
+use rand::RngCore;
 
 use crate::{
     errors::CryptoError,
@@ -362,6 +363,34 @@ pub fn parse_ss<T>(slice: &[T]) -> Result<&[T; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BY
     }
 }
 
+/// Generates a random session ID of 16 bytes, used in nonce creation
+///
+/// # Returns
+/// - `[u8; 16]`: The generated session ID
+///   The random 16-byte array
+pub fn gen_session_id() -> [u8; 16] {
+    let mut session_id = [0u8; 16];
+    rand::rng().fill_bytes(&mut session_id);
+
+    session_id
+}
+
+/// Creates a nonce from a session ID and a counter
+///
+/// # Arguments
+/// * `session_id` - The session ID (16 bytes)
+/// * `counter` - The counter value (u64)
+///
+/// # Returns
+/// - `[u8; 24]`: The generated nonce (16 bytes session ID + 8 bytes counter)
+///   The nonce is a combination of the session ID and the counter
+pub fn create_nonce(session_id: &[u8; 16], counter: u64) -> [u8; 24] {
+    let mut nonce = [0u8; 24];
+    nonce[..16].copy_from_slice(session_id);
+    nonce[16..24].copy_from_slice(&counter.to_le_bytes());
+    nonce
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,7 +404,7 @@ mod tests {
         let target_ds_pair = SignerPair::create();
 
         // Create base nonce of 16 + 8 bytes (u64 counter)
-        let base_nonce = [0u8; 24];
+        let base_nonce = create_nonce(&gen_session_id(), 0);
 
         // We now want to send a message to someone
         let (session, _) = MessageSession::new_initiator(
@@ -406,9 +435,7 @@ mod tests {
         let bob_ds = SignerPair::create();
 
         // Create base nonce
-        let base_nonce = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let base_nonce = create_nonce(&gen_session_id(), 0);
 
         // Alice initiates a session with Bob
         let (mut alice_session, ciphertext) = MessageSession::new_initiator(
@@ -476,9 +503,7 @@ mod tests {
         let bob_ds = SignerPair::create();
 
         // Create base nonce
-        let base_nonce = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let base_nonce = create_nonce(&gen_session_id(), 0);
 
         // Alice initiates a session with Bob
         let (mut alice_session, ciphertext) = MessageSession::new_initiator(
@@ -533,9 +558,8 @@ mod tests {
         let target_ds_pair = SignerPair::create();
 
         // Create base nonce with initial counter value
-        let mut base_nonce = [0u8; 24];
-        let initial_counter: u64 = 42;
-        base_nonce[16..24].copy_from_slice(&initial_counter.to_le_bytes());
+        let initial_counter = 42;
+        let base_nonce = create_nonce(&gen_session_id(), initial_counter);
 
         // Create a session
         let (mut session, _) = MessageSession::new_initiator(
@@ -566,8 +590,7 @@ mod tests {
         let target_ds_pair = SignerPair::create();
 
         // Create base nonce with counter set to MAX_NONCE_COUNTER
-        let mut base_nonce = [0u8; 24];
-        base_nonce[16..24].copy_from_slice(&MAX_NONCE_COUNTER.to_le_bytes());
+        let base_nonce = create_nonce(&gen_session_id(), MAX_NONCE_COUNTER);
 
         // Create a session
         let (mut session, _) = MessageSession::new_initiator(
