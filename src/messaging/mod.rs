@@ -550,6 +550,38 @@ mod tests {
     }
 
     #[test]
+    fn test_nonce_creation() {
+        // Generate a session ID
+        let session_id = gen_session_id();
+
+        // Create a nonce with a counter of 5
+        let counter = 5;
+        let nonce = create_nonce(&session_id, counter);
+
+        // Verify the nonce structure
+        assert_eq!(&nonce[..16], &session_id[..]);
+        assert_eq!(&nonce[16..], &counter.to_le_bytes()[..]);
+    }
+
+    #[test]
+    fn test_nonce_increment() {
+        // Generate a session ID
+        let session_id = gen_session_id();
+
+        // Create a nonce with an initial counter of 0
+        let mut nonce = create_nonce(&session_id, 0);
+
+        // Increment the counter in the nonce
+        let mut counter = u64::from_le_bytes(nonce[16..24].try_into().unwrap());
+        counter += 1;
+        nonce[16..24].copy_from_slice(&counter.to_le_bytes());
+
+        // Verify the incremented nonce
+        assert_eq!(&nonce[..16], &session_id[..]);
+        assert_eq!(u64::from_le_bytes(nonce[16..24].try_into().unwrap()), 1);
+    }
+
+    #[test]
     fn test_nonce_increment_and_counter() {
         // Generate keypairs
         let kem_pair = pair::KEMPair::create();
