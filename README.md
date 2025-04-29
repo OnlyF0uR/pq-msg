@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/pq-msg.svg)](https://crates.io/crates/pq-msg)
 [![Documentation](https://docs.rs/pq-msg/badge.svg)](https://docs.rs/pq-msg)
-[![License](https://img.shields.io/crates/l/pq-msg.svg)](LICENSE)
+[![License](https://img.shields.io/crates/l/pq-msg.svg)](https://github.com/yourusername/pq-msg)
 
 ## 🔒 Overview
 
@@ -89,7 +89,7 @@ fn main() {
 
 Run this example with:
 ```bash
-cargo run --exampel full_exchange
+cargo run --example full_exchange
 ```
 
 ## ⚠️ Important Notice
