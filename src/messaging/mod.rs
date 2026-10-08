@@ -1,84 +1,92 @@
-use pqcrypto_falcon::{
-    falconpadded1024::{self},
-    ffi::{
-        PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_BYTES,
-        PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES,
-        PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_SECRETKEYBYTES,
-    },
-};
-use pqcrypto_mlkem::{
-    ffi::{
-        PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES, PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES,
-        PQCLEAN_MLKEM1024_CLEAN_CRYPTO_PUBLICKEYBYTES,
-        PQCLEAN_MLKEM1024_CLEAN_CRYPTO_SECRETKEYBYTES,
-    },
-    mlkem1024::{self, SharedSecret},
-};
-use pqcrypto_traits::kem::{Ciphertext, PublicKey};
-use pqcrypto_traits::sign::SignedMessage;
-use rand::RngCore;
+use hkdf::Hkdf;
+use rand_core::{OsRng, RngCore};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::{
     errors::CryptoError,
     exchange::{
-        encryptor,
-        pair::{self, KEMPair, b2ss, ss2b},
+        encryptor::Encryptor,
+        pair::{self, KEMPair},
+        prekey::SignedPrekey,
     },
-    signatures::keypair::{SignerPair, VerifierPair, ViewOperations},
+    signatures::keypair::{self, PublicKeyBytes, SignerPair, VerifierPair, ViewOperations},
 };
 
-/// The maximum value a nonce counter can reach before rolling over
-const MAX_NONCE_COUNTER: u64 = u64::MAX - 1;
+/// Protocol label hashed into every session transcript
+const PROTOCOL_LABEL: &[u8] = b"pq-msg/v2";
+/// Version byte of the `MessageSession::to_bytes` format
+const SESSION_FORMAT_VERSION: u8 = 2;
+/// Direction tags, signed with every message so it can't be reflected back to its sender
+const INITIATOR_TO_RESPONDER: u8 = 0;
+const RESPONDER_TO_INITIATOR: u8 = 1;
+/// Length of a serialized session
+const SESSION_BYTES: usize = 2
+    + keypair::PUBLIC_KEY_BYTES
+    + keypair::SECRET_KEY_BYTES
+    + keypair::PUBLIC_KEY_BYTES
+    + 32 * 3
+    + 16
+    + 8 * 2;
 
 /// MessageSession manages the cryptographic state for secure message exchange
 /// between two parties using post-quantum cryptographic algorithms.
 ///
 /// Each session contains:
-/// - A KEM keypair for key encapsulation mechanism
-/// - A digital signature keypair for signing messages
-/// - A shared secret established with the other party
+/// - A digital signature keypair for signing our messages
 /// - A verifier for validating messages from the other party
-/// - A nonce for preventing replay attacks
+/// - One chain key and one counter per direction, derived from the ML-KEM shared
+///   secret, so both parties can send at the same time without nonce reuse
+/// - A transcript hash of the handshake that every message signature is bound to
+///
+/// Every message is encrypted with its own key, derived from the chain key, after which
+/// the chain key moves forward and the old one is wiped. Someone who steals the session
+/// (or a stored `to_bytes()` copy) can't decrypt the messages that came before.
+///
+/// Messages must be validated in the order they were crafted.
 pub struct MessageSession {
-    /// The KEM keypair for this session
-    kem_pair: pair::KEMPair,
     /// The digital signature keypair for this session
     ds_pair: SignerPair,
-    /// The shared secret established with the other party
-    shared_secret: SharedSecret,
     /// The verifier for the other party's messages
     target_verifier: VerifierPair,
-    /// The current nonce: 0..16 session id, 16..24 counter (u64, 8 bytes)
-    current_nonce: [u8; 24],
+    /// Whether we initiated the session, which decides our sending direction
+    is_initiator: bool,
+    /// Hash of the handshake: session id, both identities, KEM public key and ciphertext
+    transcript: [u8; 32],
+    /// Chain key for the next message we send
+    send_chain: Zeroizing<[u8; 32]>,
+    /// Chain key for the next message we receive
+    recv_chain: Zeroizing<[u8; 32]>,
+    /// Session id, the first 16 bytes of every nonce
+    session_id: [u8; 16],
+    /// Counter of the last message we sent
+    send_counter: u64,
+    /// Counter of the last message we received
+    recv_counter: u64,
 }
 
 impl MessageSession {
     /// Serializes the session to a byte array
     ///
     /// # Returns
-    /// - `Result<Vec<u8>, CryptoError>`: The serialized session or an error
+    /// The serialized session (wiped when dropped)
     ///
     /// # Security Note
     /// The serialized data contains sensitive cryptographic material including private keys.
     /// It should be stored securely and only deserialized in a trusted environment.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, CryptoError> {
-        let mut bytes = Vec::new();
-
-        // PQCLEAN_MLKEM1024_CLEAN_CRYPTO_PUBLICKEYBYTES + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_SECRETKEYBYTES
-        bytes.extend_from_slice(self.kem_pair.to_bytes_uniform().as_slice());
-
-        // PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_SECRETKEYBYTES
-        bytes.extend_from_slice(self.ds_pair.to_bytes_uniform().as_slice());
-
-        // PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES
-        bytes.extend_from_slice(&ss2b(&self.shared_secret));
-
-        // Target verifier
-        bytes.extend_from_slice(&self.target_verifier.to_bytes());
-
-        // Current nonce
-        bytes.extend_from_slice(&self.current_nonce[..]);
-        Ok(bytes)
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let mut bytes = Zeroizing::new(Vec::with_capacity(SESSION_BYTES));
+        bytes.push(SESSION_FORMAT_VERSION);
+        bytes.push(self.is_initiator as u8);
+        bytes.extend_from_slice(&self.ds_pair.to_bytes_uniform());
+        bytes.extend_from_slice(self.target_verifier.pub_key_bytes());
+        bytes.extend_from_slice(&self.transcript);
+        bytes.extend_from_slice(&self.send_chain[..]);
+        bytes.extend_from_slice(&self.recv_chain[..]);
+        bytes.extend_from_slice(&self.session_id);
+        bytes.extend_from_slice(&self.send_counter.to_le_bytes());
+        bytes.extend_from_slice(&self.recv_counter.to_le_bytes());
+        bytes
     }
 
     /// Deserializes a session from a byte array
@@ -90,147 +98,163 @@ impl MessageSession {
     /// - `Result<Self, CryptoError>`: The deserialized session or an error
     ///
     /// # Errors
-    /// Returns an error if the byte array is not the correct length or format
+    /// Returns an error if the byte array is not the correct length, version or format
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        // Calculate expected byte length for validation
-        let expected_length = PQCLEAN_MLKEM1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-            + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_SECRETKEYBYTES
-            + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-            + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_SECRETKEYBYTES
-            + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES
-            + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-            + 24;
-
-        if bytes.len() != expected_length {
-            return Err(CryptoError::IncongruentLength(expected_length, bytes.len()));
+        if bytes.len() != SESSION_BYTES {
+            return Err(CryptoError::IncongruentLength(SESSION_BYTES, bytes.len()));
+        }
+        if bytes[0] != SESSION_FORMAT_VERSION || bytes[1] > 1 {
+            return Err(CryptoError::InvalidSession);
         }
 
-        let mut idx = 0;
-
-        // Parse KEM keypair
-        let kem_pair = pair::KEMPair::from_bytes_uniform(
-            &bytes[idx..idx
-                + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-                + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_SECRETKEYBYTES],
-        )?;
-
-        idx += PQCLEAN_MLKEM1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-            + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_SECRETKEYBYTES;
-
-        // Parse DS keypair
-        let ds_pair = SignerPair::from_bytes_uniform(
-            &bytes[idx..idx
-                + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-                + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_SECRETKEYBYTES],
-        )?;
-
-        idx += PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES
-            + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_SECRETKEYBYTES;
-
-        // Parse shared secret
-        let ss_bytes = &bytes[idx..idx + PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES];
-        let shared_secret = b2ss(parse_ss(ss_bytes)?);
-        idx += PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES;
-
-        // Parse target verifier
-        let target_verifier = VerifierPair::from_bytes(
-            &bytes[idx..idx + PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES],
-        )?;
-        idx += PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES;
-
-        // Parse current nonce
-        let current_nonce = bytes[idx..idx + 24].try_into().unwrap();
-        idx += 24;
-
-        // Final validation
-        if idx != bytes.len() {
-            return Err(CryptoError::IncongruentLength(bytes.len(), idx));
-        }
+        let mut rest = &bytes[2..];
+        let mut take = |n: usize| {
+            let (head, tail) = rest.split_at(n);
+            rest = tail;
+            head
+        };
 
         Ok(Self {
-            kem_pair,
-            ds_pair,
-            shared_secret,
-            target_verifier,
-            current_nonce,
+            is_initiator: bytes[1] == 1,
+            ds_pair: SignerPair::from_bytes_uniform(take(
+                keypair::PUBLIC_KEY_BYTES + keypair::SECRET_KEY_BYTES,
+            ))?,
+            target_verifier: VerifierPair::new(take(keypair::PUBLIC_KEY_BYTES))?,
+            transcript: take(32).try_into()?,
+            send_chain: Zeroizing::new(take(32).try_into()?),
+            recv_chain: Zeroizing::new(take(32).try_into()?),
+            session_id: take(16).try_into()?,
+            send_counter: u64::from_le_bytes(take(8).try_into()?),
+            recv_counter: u64::from_le_bytes(take(8).try_into()?),
         })
     }
 
     /// Creates a new session as the initiator
     ///
+    /// Send the responder everything it needs to call [`MessageSession::new_responder`]:
+    /// the returned ciphertext, `target_prekey.id()`, the base nonce and your FN-DSA
+    /// public key.
+    ///
     /// # Arguments
-    /// * `my_keypair` - Your own KEM keypair
     /// * `my_signer` - Your own signer pair
-    /// * `base_nonce` - Base nonce (0..16 session id, 16..24 counter)
-    /// * `target_pubkey` - KEM public key of the target
-    /// * `target_verifier` - Falcon verifier containing the public key of the target
+    /// * `base_nonce` - Base nonce (0..16 session id, 16..24 counter), shared with the responder
+    /// * `target_prekey` - A signed prekey of the target
+    /// * `target_verifier` - FN-DSA public key of the target. Get it from a source you
+    ///   trust: it is what proves the prekey really belongs to the target.
     ///
     /// # Returns
-    /// - `Result<(Self, [u8; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES]), CryptoError>`:
-    ///   The session and ciphertext for the responder, or an error
+    /// - `Result<(Self, [u8; pair::CIPHERTEXT_BYTES]), CryptoError>`:
+    ///   The session and ciphertext for the responder, or `InvalidSignature` if the
+    ///   prekey was not signed by `target_verifier`
     pub fn new_initiator(
-        my_keypair: KEMPair,   // This the your own keypair
-        my_signer: SignerPair, // This is your own signer pair
-        base_nonce: [u8; 24], // 0..16 session id, 16..24 counter (u64, 8 bytes), provided by server
-        target_pubkey: &[u8; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_PUBLICKEYBYTES], // KEM public key of the target
-        target_verifier: &[u8; PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES], // Falcon verifier containing the falcon public key of the target
-    ) -> Result<(Self, [u8; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES]), CryptoError> {
-        let pubkey = mlkem1024::PublicKey::from_bytes(target_pubkey)?;
+        my_signer: SignerPair,
+        base_nonce: [u8; 24],
+        target_prekey: &SignedPrekey,
+        target_verifier: &PublicKeyBytes,
+    ) -> Result<(Self, [u8; pair::CIPHERTEXT_BYTES]), CryptoError> {
+        let target_verifier = VerifierPair::new(target_verifier)?;
+        if !target_prekey.verify(target_verifier.pub_key_bytes()) {
+            return Err(CryptoError::InvalidSignature);
+        }
 
-        // We are the initiator, we need to encapsulate a shared secret for the receiver
-        let (shared_secret, ciphertext) = my_keypair.encapsulate(&pubkey);
+        // We are the initiator, we encapsulate a shared secret for the responder
+        let (shared_secret, ciphertext) = KEMPair::encapsulate(target_prekey.kem_pub_key())?;
 
-        // This contains the falcon public key of the target we are trying to reach
-        // We will need this to verify his/her messages (signatures)
-        let target_verifier = VerifierPair::from_bytes(target_verifier)?;
-
-        // Return the ciphertext and shared secret
-        Ok((
-            Self {
-                kem_pair: my_keypair,
-                ds_pair: my_signer,
-                shared_secret,
-                target_verifier,
-                current_nonce: base_nonce,
-            },
-            ct2b(&ciphertext)?,
-        ))
+        let session = Self::establish(
+            my_signer,
+            target_verifier,
+            true,
+            base_nonce,
+            target_prekey.kem_pub_key(),
+            &ciphertext,
+            &shared_secret,
+        );
+        Ok((session, ciphertext))
     }
 
     /// Creates a new session as the responder
     ///
+    /// If `my_prekey` is a one-time prekey, delete it everywhere you store it once
+    /// this returns. That deletion is what gives the session forward secrecy.
+    ///
     /// # Arguments
-    /// * `my_keypair` - Your own KEM keypair
+    /// * `my_prekey` - The prekey the initiator used (look it up by the id they sent)
     /// * `my_signer` - Your own signer pair
-    /// * `base_nonce` - Base nonce (0..16 session id, 16..24 counter)
-    /// * `ciphertext_bytes` - KEM ciphertext sent by the initiator
-    /// * `sender_verifier` - Falcon verifier containing the public key of the initiator
+    /// * `base_nonce` - Base nonce (0..16 session id, 16..24 counter), shared with the initiator
+    /// * `ciphertext` - KEM ciphertext sent by the initiator
+    /// * `sender_verifier` - FN-DSA public key of the initiator
     ///
     /// # Returns
     /// - `Result<Self, CryptoError>`: The session or an error
     pub fn new_responder(
-        my_keypair: KEMPair,   // This the your own keypair
-        my_signer: SignerPair, // This is your own signer pair
-        base_nonce: [u8; 24], // 0..16 session id, 16..24 counter (u64, 8 bytes), provided by server
-        ciphertext_bytes: &[u8; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES], // KEM ciphertext sent to us by the initiator
-        sender_verifier: &[u8; PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_PUBLICKEYBYTES], // Falcon verifier containing the falcon public key of the initiator
+        my_prekey: &KEMPair,
+        my_signer: SignerPair,
+        base_nonce: [u8; 24],
+        ciphertext: &[u8; pair::CIPHERTEXT_BYTES],
+        sender_verifier: &PublicKeyBytes,
     ) -> Result<Self, CryptoError> {
-        // We just have someone that attempts to establish a shared secret with us
+        let target_verifier = VerifierPair::new(sender_verifier)?;
+        let shared_secret = my_prekey.decapsulate(ciphertext);
 
-        // Compute the shared secret using our private key
-        let ciphertext = Ciphertext::from_bytes(ciphertext_bytes)?;
-        let shared_secret = my_keypair.decapsulate(&ciphertext)?;
-
-        // This contains the verifier pubkey of the sender that is trying to reach us
-        let target_verifier = VerifierPair::from_bytes(sender_verifier)?;
-
-        Ok(Self {
-            kem_pair: my_keypair,
-            ds_pair: my_signer,
-            shared_secret,
+        Ok(Self::establish(
+            my_signer,
             target_verifier,
-            current_nonce: base_nonce,
-        })
+            false,
+            base_nonce,
+            &my_prekey.pub_key_bytes(),
+            ciphertext,
+            &shared_secret,
+        ))
+    }
+
+    /// Derives the transcript and one chain key per direction, identically on both sides
+    fn establish(
+        ds_pair: SignerPair,
+        target_verifier: VerifierPair,
+        is_initiator: bool,
+        base_nonce: [u8; 24],
+        responder_kem_pubkey: &[u8; pair::PUBLIC_KEY_BYTES],
+        ciphertext: &[u8; pair::CIPHERTEXT_BYTES],
+        shared_secret: &[u8; pair::SHARED_SECRET_BYTES],
+    ) -> Self {
+        let (initiator, responder) = if is_initiator {
+            (ds_pair.pub_key_bytes(), target_verifier.pub_key_bytes())
+        } else {
+            (target_verifier.pub_key_bytes(), ds_pair.pub_key_bytes())
+        };
+
+        // All fields are fixed-length, so plain concatenation is unambiguous
+        let transcript: [u8; 32] = Sha256::new()
+            .chain_update(PROTOCOL_LABEL)
+            .chain_update(base_nonce)
+            .chain_update(initiator)
+            .chain_update(responder)
+            .chain_update(responder_kem_pubkey)
+            .chain_update(ciphertext)
+            .finalize()
+            .into();
+
+        let hkdf = Hkdf::<Sha256>::new(Some(&transcript), shared_secret);
+        let mut i2r = Zeroizing::new([0u8; 32]);
+        let mut r2i = Zeroizing::new([0u8; 32]);
+        hkdf.expand(b"pq-msg/v2 initiator->responder", &mut i2r[..])
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        hkdf.expand(b"pq-msg/v2 responder->initiator", &mut r2i[..])
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        let (send_chain, recv_chain) = if is_initiator { (i2r, r2i) } else { (r2i, i2r) };
+
+        let counter = u64::from_le_bytes(base_nonce[16..].try_into().unwrap());
+        Self {
+            ds_pair,
+            target_verifier,
+            is_initiator,
+            transcript,
+            send_chain,
+            recv_chain,
+            session_id: base_nonce[..16].try_into().unwrap(),
+            send_counter: counter,
+            recv_counter: counter,
+        }
     }
 
     /// Creates a signed and encrypted message for the other party
@@ -242,17 +266,28 @@ impl MessageSession {
     /// - `Result<Vec<u8>, CryptoError>`: The encrypted message or an error
     ///
     /// # Security Note
-    /// This method automatically increments the nonce counter to ensure
-    /// uniqueness for each message.
+    /// This method increments the send counter to ensure a unique nonce for each
+    /// message, and fails with `NonceExhausted` instead of ever reusing one.
     pub fn craft_message(&mut self, message: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        // Sign the message with our digital signature key
-        let sig = self.ds_pair.sign(message);
+        let counter = self
+            .send_counter
+            .checked_add(1)
+            .ok_or(CryptoError::NonceExhausted)?;
+        let direction = self.send_direction();
 
-        // Increment the nonce for this message
-        self.increment_nonce();
+        // Sign the message bound to this session, direction and position
+        let signed_data = self.signed_data(direction, counter, message);
+        let sig = self.ds_pair.sign(&signed_data)?;
 
-        // Encrypt the signed message with the shared secret
-        encryptor::Encryptor::new(self.shared_secret).encrypt(&sig.as_bytes(), &self.current_nonce)
+        let plaintext = Zeroizing::new([&sig[..], message].concat());
+        let (message_key, next_chain) = ratchet(&self.send_chain);
+        let ciphertext = Encryptor::new(&message_key)
+            .encrypt(&plaintext, &create_nonce(&self.session_id, counter))?;
+
+        // Assigning drops (and wipes) the old chain key
+        self.send_chain = next_chain;
+        self.send_counter = counter;
+        Ok(ciphertext)
     }
 
     /// Decrypts and validates a message from the other party
@@ -264,103 +299,80 @@ impl MessageSession {
     /// - `Result<Vec<u8>, CryptoError>`: The decrypted and validated message or an error
     ///
     /// # Security Note
-    /// This method automatically increments the nonce counter to match
-    /// the sender's nonce. If the nonces are out of sync, validation will fail.
+    /// Messages must arrive in the order they were crafted. The receive counter only
+    /// advances for authentic messages, so replayed or forged input is rejected
+    /// without desynchronizing the session.
     pub fn validate_message(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        // Increment the nonce to match the sender's nonce
-        self.increment_nonce();
+        let counter = self
+            .recv_counter
+            .checked_add(1)
+            .ok_or(CryptoError::NonceExhausted)?;
+        let direction = 1 - self.send_direction();
 
-        // Decrypt the message using the shared secret
-        let decrypted_message = encryptor::Encryptor::new(self.shared_secret)
-            .decrypt(ciphertext, &self.current_nonce)?;
-
-        // Verify that the decrypted message is large enough to contain a signature
-        if decrypted_message.len() < PQCLEAN_FALCONPADDED1024_CLEAN_CRYPTO_BYTES {
-            return Err(CryptoError::FalconSignatureTooShort(
-                decrypted_message.len(),
-            ));
+        let (message_key, next_chain) = ratchet(&self.recv_chain);
+        let mut plaintext = Encryptor::new(&message_key)
+            .decrypt(ciphertext, &create_nonce(&self.session_id, counter))?;
+        if plaintext.len() < keypair::SIGNATURE_BYTES {
+            return Err(CryptoError::InvalidSignature);
         }
 
-        // Parse the signed message and verify the signature
-        let sm = falconpadded1024::SignedMessage::from_bytes(&decrypted_message)?;
-        let msg = self.target_verifier.verify_message(&sm)?;
+        let (sig, message) = plaintext.split_at(keypair::SIGNATURE_BYTES);
+        if !self
+            .target_verifier
+            .verify(&self.signed_data(direction, counter, message), sig)
+        {
+            return Err(CryptoError::InvalidSignature);
+        }
 
-        // Return the verified message
-        Ok(msg)
+        self.recv_chain = next_chain;
+        self.recv_counter = counter;
+        plaintext.drain(..keypair::SIGNATURE_BYTES);
+        Ok(plaintext)
     }
 
-    /// Increments the nonce counter safely, handling overflow
-    ///
-    /// # Security Note
-    /// If the counter reaches its maximum value, it will wrap around to 0.
-    /// This is a compromise between security and usability, as the session
-    /// should ideally be refreshed before reaching this limit.
-    fn increment_nonce(&mut self) {
-        let mut counter = u64::from_le_bytes(self.current_nonce[16..24].try_into().unwrap());
-
-        // Check for potential overflow
-        if counter >= MAX_NONCE_COUNTER {
-            // Reset counter to 0 when it reaches max value
-            // In a production system, you might want to regenerate the session instead
-            counter = 0;
+    /// The direction tag of the messages we send
+    fn send_direction(&self) -> u8 {
+        if self.is_initiator {
+            INITIATOR_TO_RESPONDER
         } else {
-            counter += 1;
+            RESPONDER_TO_INITIATOR
         }
-
-        self.current_nonce[16..24].copy_from_slice(&counter.to_le_bytes());
     }
 
-    /// Gets the current nonce counter value
-    ///
-    /// # Returns
-    /// - `u64`: The current nonce counter value
-    pub fn get_counter(&self) -> u64 {
-        u64::from_le_bytes(self.current_nonce[16..24].try_into().unwrap())
+    /// The bytes actually signed for a message: transcript || direction || counter || message
+    fn signed_data(&self, direction: u8, counter: u64, message: &[u8]) -> Vec<u8> {
+        [
+            &self.transcript[..],
+            &[direction],
+            &counter.to_le_bytes(),
+            message,
+        ]
+        .concat()
     }
-}
 
-/// Converts a ciphertext to a byte array
-///
-/// # Arguments
-/// * `ct` - The ciphertext to convert
-///
-/// # Returns
-/// - `Result<[u8; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES], CryptoError>`:
-///   The byte array or an error
-fn ct2b(
-    ct: &mlkem1024::Ciphertext,
-) -> Result<[u8; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES], CryptoError> {
-    let slice = ct.as_bytes();
+    /// Gets the counter of the last message sent
+    pub fn send_counter(&self) -> u64 {
+        self.send_counter
+    }
 
-    if slice.len() == PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES {
-        let ptr = slice.as_ptr() as *const [u8; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES];
-        unsafe { Ok(*ptr) }
-    } else {
-        Err(CryptoError::IncongruentLength(
-            PQCLEAN_MLKEM1024_CLEAN_CRYPTO_CIPHERTEXTBYTES,
-            slice.len(),
-        ))
+    /// Gets the counter of the last message received
+    pub fn recv_counter(&self) -> u64 {
+        self.recv_counter
     }
 }
 
-/// Parses a byte slice into a fixed-size array for a shared secret
+/// Splits a chain key into the key for one message and the next chain key
 ///
-/// # Arguments
-/// * `slice` - The byte slice to parse
-///
-/// # Returns
-/// - `Result<&[T; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES], CryptoError>`:
-///   The fixed-size array or an error
-pub fn parse_ss<T>(slice: &[T]) -> Result<&[T; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES], CryptoError> {
-    if slice.len() == PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES {
-        let ptr = slice.as_ptr() as *const [T; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES];
-        unsafe { Ok(&*ptr) }
-    } else {
-        Err(CryptoError::IncongruentLength(
-            PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BYTES,
-            slice.len(),
-        ))
-    }
+/// This is a one-way step: the next chain key can't be turned back into this one.
+fn ratchet(chain: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+    let hkdf = Hkdf::<Sha256>::from_prk(chain).expect("32 bytes is a valid HKDF-SHA256 PRK");
+    let mut message_key = Zeroizing::new([0u8; 32]);
+    let mut next_chain = Zeroizing::new([0u8; 32]);
+    hkdf.expand(b"pq-msg/v2 message key", &mut message_key[..])
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    hkdf.expand(b"pq-msg/v2 chain key", &mut next_chain[..])
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    (message_key, next_chain)
 }
 
 /// Generates a random session ID of 16 bytes, used in nonce creation
@@ -370,7 +382,7 @@ pub fn parse_ss<T>(slice: &[T]) -> Result<&[T; PQCLEAN_MLKEM1024_CLEAN_CRYPTO_BY
 ///   The random 16-byte array
 pub fn gen_session_id() -> [u8; 16] {
     let mut session_id = [0u8; 16];
-    rand::rng().fill_bytes(&mut session_id);
+    OsRng.fill_bytes(&mut session_id);
 
     session_id
 }
@@ -395,158 +407,422 @@ pub fn create_nonce(session_id: &[u8; 16], counter: u64) -> [u8; 24] {
 mod tests {
     use super::*;
 
+    /// A new prekey for `owner`: the secret part and the signed public part
+    fn signed_prekey(owner: &mut SignerPair) -> (KEMPair, SignedPrekey) {
+        let prekey = KEMPair::create();
+        let signed = SignedPrekey::new(owner, &prekey).unwrap();
+        (prekey, signed)
+    }
+
+    /// Alice (initiator) and Bob (responder) with a fresh session
+    fn session_pair(base_counter: u64) -> (MessageSession, MessageSession) {
+        let alice_ds = SignerPair::create();
+        let mut bob_ds = SignerPair::create();
+        let (bob_prekey, bob_signed_prekey) = signed_prekey(&mut bob_ds);
+        let base_nonce = create_nonce(&gen_session_id(), base_counter);
+
+        let (alice, ciphertext) = MessageSession::new_initiator(
+            alice_ds.clone(),
+            base_nonce,
+            &bob_signed_prekey,
+            bob_ds.pub_key_bytes(),
+        )
+        .unwrap();
+        let bob = MessageSession::new_responder(
+            &bob_prekey,
+            bob_ds,
+            base_nonce,
+            &ciphertext,
+            alice_ds.pub_key_bytes(),
+        )
+        .unwrap();
+        (alice, bob)
+    }
+
     #[test]
     fn test_message_session_serialization() {
-        // Generate necessary keypairs
-        let kem_pair = pair::KEMPair::create();
-        let ds_pair = SignerPair::create();
-        let target_kem_pair = pair::KEMPair::create();
-        let target_ds_pair = SignerPair::create();
+        let (mut alice, mut bob) = session_pair(0);
+        bob.validate_message(&alice.craft_message(b"before").unwrap())
+            .unwrap();
 
-        // Create base nonce of 16 + 8 bytes (u64 counter)
+        // Serialize and deserialize Alice, then keep talking with the restored copy
+        let mut restored = MessageSession::from_bytes(&alice.to_bytes()).unwrap();
+        assert_eq!(alice.to_bytes(), restored.to_bytes());
+        assert_eq!(restored.send_counter(), 1);
+
+        let msg = bob.validate_message(&restored.craft_message(b"after").unwrap());
+        assert_eq!(msg.unwrap(), b"after");
+        let reply = restored.validate_message(&bob.craft_message(b"reply").unwrap());
+        assert_eq!(reply.unwrap(), b"reply");
+    }
+
+    #[test]
+    fn test_session_deserialization_rejects_bad_input() {
+        let (alice, _) = session_pair(0);
+        let bytes = alice.to_bytes();
+
+        assert!(matches!(
+            MessageSession::from_bytes(&bytes[1..]),
+            Err(CryptoError::IncongruentLength(SESSION_BYTES, _))
+        ));
+
+        let mut wrong_version = bytes.to_vec();
+        wrong_version[0] = 1;
+        assert!(matches!(
+            MessageSession::from_bytes(&wrong_version),
+            Err(CryptoError::InvalidSession)
+        ));
+
+        let mut wrong_role = bytes.to_vec();
+        wrong_role[1] = 2;
+        assert!(matches!(
+            MessageSession::from_bytes(&wrong_role),
+            Err(CryptoError::InvalidSession)
+        ));
+
+        // Corrupted key material: our own public key no longer matches our secret key
+        let mut wrong_own_key = bytes.to_vec();
+        wrong_own_key[3] ^= 1;
+        assert!(matches!(
+            MessageSession::from_bytes(&wrong_own_key),
+            Err(CryptoError::InvalidKey)
+        ));
+
+        // Corrupted peer key: it no longer decodes
+        let mut wrong_peer_key = bytes.to_vec();
+        wrong_peer_key[2 + keypair::PUBLIC_KEY_BYTES + keypair::SECRET_KEY_BYTES] ^= 0xFF;
+        assert!(matches!(
+            MessageSession::from_bytes(&wrong_peer_key),
+            Err(CryptoError::InvalidKey)
+        ));
+    }
+
+    #[test]
+    fn test_wrong_peer_identity_rejected() {
+        // Bob believes the session came from Carol; Alice's messages must not pass as hers
+        let alice_ds = SignerPair::create();
+        let carol_ds = SignerPair::create();
+        let mut bob_ds = SignerPair::create();
+        let (bob_prekey, bob_signed_prekey) = signed_prekey(&mut bob_ds);
         let base_nonce = create_nonce(&gen_session_id(), 0);
 
-        // We now want to send a message to someone
-        let (session, _) = MessageSession::new_initiator(
-            kem_pair,                               // our kem pair
-            ds_pair,                                // our ds pair
-            base_nonce,                             // base nonce
-            &target_kem_pair.to_bytes().unwrap().0, // target public key
-            &target_ds_pair.to_bytes().unwrap().0,  // target verifier public key
+        let (mut alice, ct) = MessageSession::new_initiator(
+            alice_ds,
+            base_nonce,
+            &bob_signed_prekey,
+            bob_ds.pub_key_bytes(),
+        )
+        .unwrap();
+        let mut bob = MessageSession::new_responder(
+            &bob_prekey,
+            bob_ds,
+            base_nonce,
+            &ct,
+            carol_ds.pub_key_bytes(),
         )
         .unwrap();
 
-        // Serialize the session
-        let serialized = session.to_bytes().unwrap();
+        assert!(
+            bob.validate_message(&alice.craft_message(b"hi").unwrap())
+                .is_err()
+        );
+    }
 
-        // Deserialize and verify the session
-        let deserialized = MessageSession::from_bytes(&serialized).unwrap();
+    #[test]
+    fn test_invalid_peer_keys_rejected() {
+        let mut bob_ds = SignerPair::create();
+        let (bob_prekey, bob_signed_prekey) = signed_prekey(&mut bob_ds);
+        let base_nonce = create_nonce(&gen_session_id(), 0);
+        let mut undecodable = *bob_ds.pub_key_bytes();
+        undecodable[0] ^= 0xFF;
 
-        // Verify both sessions have the same nonce
-        assert_eq!(session.current_nonce, deserialized.current_nonce);
+        let initiator = MessageSession::new_initiator(
+            SignerPair::create(),
+            base_nonce,
+            &bob_signed_prekey,
+            &undecodable,
+        );
+        assert!(matches!(initiator, Err(CryptoError::InvalidKey)));
+
+        let responder = MessageSession::new_responder(
+            &bob_prekey,
+            bob_ds,
+            base_nonce,
+            &[0u8; pair::CIPHERTEXT_BYTES],
+            &undecodable,
+        );
+        assert!(matches!(responder, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn test_plaintext_too_short_for_signature() {
+        // Only the peer holds the key, but a buggy or malicious peer could still send this
+        let (alice, mut bob) = session_pair(0);
+        let short = Encryptor::new(&ratchet(&alice.send_chain).0)
+            .encrypt(b"no signature here", &create_nonce(&alice.session_id, 1))
+            .unwrap();
+
+        assert!(matches!(
+            bob.validate_message(&short),
+            Err(CryptoError::InvalidSignature)
+        ));
+        assert_eq!(bob.recv_counter(), 0);
     }
 
     #[test]
     fn test_full_message_exchange() {
-        // Generate keypairs for both Alice and Bob
-        let alice_kem = pair::KEMPair::create();
-        let alice_ds = SignerPair::create();
-        let bob_kem = pair::KEMPair::create();
-        let bob_ds = SignerPair::create();
+        let (mut alice, mut bob) = session_pair(0);
 
-        // Create base nonce
-        let base_nonce = create_nonce(&gen_session_id(), 0);
-
-        // Alice initiates a session with Bob
-        let (mut alice_session, ciphertext) = MessageSession::new_initiator(
-            alice_kem,
-            alice_ds.clone(),
-            base_nonce,
-            &bob_kem.to_bytes().unwrap().0,
-            &bob_ds.to_bytes().unwrap().0,
-        )
-        .unwrap();
-
-        // Bob responds to Alice's session initiation
-        let mut bob_session = MessageSession::new_responder(
-            bob_kem,
-            bob_ds.clone(),
-            base_nonce,
-            &ciphertext,
-            &alice_ds.to_bytes().unwrap().0,
-        )
-        .unwrap();
-
-        assert_eq!(
-            ss2b(&alice_session.shared_secret),
-            ss2b(&bob_session.shared_secret)
-        );
+        // Each side derived the other's chain keys
+        assert_eq!(alice.send_chain, bob.recv_chain);
+        assert_eq!(alice.recv_chain, bob.send_chain);
+        assert_ne!(alice.send_chain, alice.recv_chain);
+        assert_eq!(alice.transcript, bob.transcript);
 
         // Alice sends a message to Bob
         let message = b"Hello, Bob! This is a secret message.";
-        let encrypted_message = alice_session.craft_message(message).unwrap();
-
-        assert_eq!(
-            alice_session.current_nonce[16..24],
-            [1, 0, 0, 0, 0, 0, 0, 0]
-        );
-        assert_eq!(bob_session.current_nonce[16..24], [0, 0, 0, 0, 0, 0, 0, 0]);
+        let encrypted_message = alice.craft_message(message).unwrap();
+        assert_eq!(alice.send_counter(), 1);
+        assert_eq!(bob.recv_counter(), 0);
 
         // Bob decrypts and verifies Alice's message
-        let raw_message = bob_session.validate_message(&encrypted_message).unwrap();
-
-        assert_eq!(bob_session.current_nonce[16..24], [1, 0, 0, 0, 0, 0, 0, 0]);
-
-        // Check if the decrypted message matches the original
+        let raw_message = bob.validate_message(&encrypted_message).unwrap();
+        assert_eq!(bob.recv_counter(), 1);
         assert_eq!(raw_message, message);
 
-        // // Bob replies to Alice
+        // Bob replies to Alice
         let reply = b"Hello, Alice! I received your message safely.";
-        let encrypted_reply = bob_session.craft_message(reply).unwrap();
-
-        // // Alice decrypts and verifies Bob's reply
-        let raw_reply = alice_session.validate_message(&encrypted_reply).unwrap();
-
-        // Bob and alices nonces should now equal
-        assert_eq!(alice_session.current_nonce, bob_session.current_nonce);
-
-        // // Check if the decrypted reply matches the original
+        let encrypted_reply = bob.craft_message(reply).unwrap();
+        let raw_reply = alice.validate_message(&encrypted_reply).unwrap();
         assert_eq!(raw_reply, reply);
+
+        assert_eq!(alice.send_counter(), bob.recv_counter());
+        assert_eq!(alice.recv_counter(), bob.send_counter());
     }
 
     #[test]
-    fn test_nonce_desync() {
-        // Generate keypairs for both Alice and Bob
-        let alice_kem = pair::KEMPair::create();
-        let alice_ds = SignerPair::create();
-        let bob_kem = pair::KEMPair::create();
-        let bob_ds = SignerPair::create();
+    fn test_concurrent_sends() {
+        // Regression: both parties used to share one key and one counter, so two
+        // messages sent at the same time reused a key-nonce pair and leaked m_A ^ m_B
+        let (mut alice, mut bob) = session_pair(0);
 
-        // Create base nonce
+        let (ma, mb) = (
+            b"attack at dawn, bring snacks!!",
+            b"meet me at the north gate 9pm.",
+        );
+        let ca = alice.craft_message(ma).unwrap();
+        let cb = bob.craft_message(mb).unwrap();
+
+        let ct_xor: Vec<u8> = ca.iter().zip(&cb).map(|(x, y)| x ^ y).collect();
+        let pt_xor: Vec<u8> = ma.iter().zip(mb).map(|(x, y)| x ^ y).collect();
+        assert!(!ct_xor.windows(pt_xor.len()).any(|w| w == pt_xor));
+
+        // Both messages still arrive, and the session stays in sync
+        assert_eq!(bob.validate_message(&ca).unwrap(), ma);
+        assert_eq!(alice.validate_message(&cb).unwrap(), mb);
+        let next = alice.craft_message(b"next").unwrap();
+        assert_eq!(bob.validate_message(&next).unwrap(), b"next");
+    }
+
+    #[test]
+    fn test_replay_and_garbage_do_not_desync() {
+        let (mut alice, mut bob) = session_pair(0);
+
+        let first = alice.craft_message(b"first").unwrap();
+        bob.validate_message(&first).unwrap();
+
+        // A replayed message and random garbage are rejected without moving the counter
+        assert!(bob.validate_message(&first).is_err());
+        assert!(bob.validate_message(&[0u8; 2000]).is_err());
+        assert_eq!(bob.recv_counter(), 1);
+
+        let second = alice.craft_message(b"second").unwrap();
+        assert_eq!(bob.validate_message(&second).unwrap(), b"second");
+    }
+
+    #[test]
+    fn test_out_of_order_rejected() {
+        let (mut alice, mut bob) = session_pair(0);
+
+        let first = alice.craft_message(b"first").unwrap();
+        let second = alice.craft_message(b"second").unwrap();
+
+        assert!(bob.validate_message(&second).is_err());
+        assert_eq!(bob.validate_message(&first).unwrap(), b"first");
+        assert_eq!(bob.validate_message(&second).unwrap(), b"second");
+    }
+
+    #[test]
+    fn test_reflected_message_rejected() {
+        let (mut alice, _) = session_pair(0);
+
+        // Alice's own message sent back to her doesn't decrypt under her receive key
+        let msg = alice.craft_message(b"hello").unwrap();
+        assert!(alice.validate_message(&msg).is_err());
+    }
+
+    #[test]
+    fn test_forwarded_message_rejected() {
+        // Bob receives a signed message from Alice, then opens a session to Carol
+        // claiming to be Alice and forwards it. The signature is bound to the
+        // Alice-Bob transcript, so Carol must reject it.
+        let alice_ds = SignerPair::create();
+        let mut bob_ds = SignerPair::create();
+        let (bob_prekey, bob_signed_prekey) = signed_prekey(&mut bob_ds);
+        let mut carol_ds = SignerPair::create();
+        let (carol_prekey, carol_signed_prekey) = signed_prekey(&mut carol_ds);
         let base_nonce = create_nonce(&gen_session_id(), 0);
 
-        // Alice initiates a session with Bob
-        let (mut alice_session, ciphertext) = MessageSession::new_initiator(
-            alice_kem,
+        let (mut alice, ct) = MessageSession::new_initiator(
             alice_ds.clone(),
             base_nonce,
-            &bob_kem.to_bytes().unwrap().0,
-            &bob_ds.to_bytes().unwrap().0,
+            &bob_signed_prekey,
+            bob_ds.pub_key_bytes(),
         )
         .unwrap();
-
-        // Bob responds to Alice's session initiation
-        let mut bob_session = MessageSession::new_responder(
-            bob_kem,
+        let bob = MessageSession::new_responder(
+            &bob_prekey,
             bob_ds.clone(),
             base_nonce,
-            &ciphertext,
-            &alice_ds.to_bytes().unwrap().0,
+            &ct,
+            alice_ds.pub_key_bytes(),
         )
         .unwrap();
 
-        assert_eq!(
-            ss2b(&alice_session.shared_secret),
-            ss2b(&bob_session.shared_secret)
+        // Bob decrypts Alice's message to get her signature and the message
+        let sent = alice.craft_message(b"I owe Bob 100 euros").unwrap();
+        let signed = Encryptor::new(&ratchet(&bob.recv_chain).0)
+            .decrypt(&sent, &create_nonce(&bob.session_id, 1))
+            .unwrap();
+
+        // Bob opens a session to Carol, telling her he is Alice. He encapsulated the
+        // shared secret and the transcript is public, so he can derive Carol's
+        // receive key; the test simply reads it from her session.
+        let (_, ct) = MessageSession::new_initiator(
+            bob_ds,
+            base_nonce,
+            &carol_signed_prekey,
+            carol_ds.pub_key_bytes(),
+        )
+        .unwrap();
+        let mut carol = MessageSession::new_responder(
+            &carol_prekey,
+            carol_ds,
+            base_nonce,
+            &ct,
+            alice_ds.pub_key_bytes(),
+        )
+        .unwrap();
+        let forged = Encryptor::new(&ratchet(&carol.recv_chain).0)
+            .encrypt(&signed, &create_nonce(&carol.session_id, 1))
+            .unwrap();
+
+        assert!(matches!(
+            carol.validate_message(&forged),
+            Err(CryptoError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn test_stolen_session_cannot_read_past_messages() {
+        let (mut alice, mut bob) = session_pair(0);
+
+        let first = alice.craft_message(b"first").unwrap();
+        bob.validate_message(&first).unwrap();
+
+        // An attacker later steals Bob's stored session and rewinds its counter.
+        // The chain key has already moved on, so the old message stays unreadable.
+        let mut stolen = MessageSession::from_bytes(&bob.to_bytes()).unwrap();
+        stolen.recv_counter = 0;
+        assert!(stolen.validate_message(&first).is_err());
+    }
+
+    #[test]
+    fn test_deleted_prekey_gives_forward_secrecy() {
+        let alice_ds = SignerPair::create();
+        let mut bob_ds = SignerPair::create();
+        let (last_resort, _) = signed_prekey(&mut bob_ds);
+        let (one_time, one_time_signed) = signed_prekey(&mut bob_ds);
+        let base_nonce = create_nonce(&gen_session_id(), 0);
+
+        let (mut alice, ct) = MessageSession::new_initiator(
+            alice_ds.clone(),
+            base_nonce,
+            &one_time_signed,
+            bob_ds.pub_key_bytes(),
+        )
+        .unwrap();
+        let mut bob = MessageSession::new_responder(
+            &one_time,
+            bob_ds.clone(),
+            base_nonce,
+            &ct,
+            alice_ds.pub_key_bytes(),
+        )
+        .unwrap();
+        drop(one_time); // Bob deletes the one-time prekey
+
+        // An attacker records the handshake and the first message
+        let recorded = alice.craft_message(b"secret").unwrap();
+        assert_eq!(bob.validate_message(&recorded).unwrap(), b"secret");
+
+        // Later every key Bob still has leaks; none of them opens the recorded session
+        let mut attacker = MessageSession::new_responder(
+            &last_resort,
+            bob_ds,
+            base_nonce,
+            &ct,
+            alice_ds.pub_key_bytes(),
+        )
+        .unwrap();
+        assert!(attacker.validate_message(&recorded).is_err());
+    }
+
+    #[test]
+    fn test_initiator_rejects_prekey_not_signed_by_target() {
+        // E.g. a malicious server hands out its own prekey for Bob
+        let bob_ds = SignerPair::create();
+        let mut mallory_ds = SignerPair::create();
+        let (_, fake) = signed_prekey(&mut mallory_ds);
+
+        let result = MessageSession::new_initiator(
+            SignerPair::create(),
+            create_nonce(&gen_session_id(), 0),
+            &fake,
+            bob_ds.pub_key_bytes(),
         );
+        assert!(matches!(result, Err(CryptoError::InvalidSignature)));
+    }
 
-        // Alice sends a message to Bob
-        let message = b"Hello, Bob! This is a secret message.";
-        let encrypted_message = alice_session.craft_message(message).unwrap();
+    #[test]
+    fn test_counter_exhaustion() {
+        let (mut alice, mut bob) = session_pair(u64::MAX - 1);
 
-        assert_eq!(
-            alice_session.current_nonce[16..24],
-            [1, 0, 0, 0, 0, 0, 0, 0]
-        );
-        assert_eq!(bob_session.current_nonce[16..24], [0, 0, 0, 0, 0, 0, 0, 0]);
+        let last = alice.craft_message(b"last").unwrap();
+        assert_eq!(alice.send_counter(), u64::MAX);
+        assert_eq!(bob.validate_message(&last).unwrap(), b"last");
 
-        // Lets artificially increase bob's nonce to simulate a desync
-        bob_session.increment_nonce();
-        assert_eq!(bob_session.current_nonce[16..24], [1, 0, 0, 0, 0, 0, 0, 0]);
+        // No wrap-around back to 0: the session refuses instead of reusing a nonce
+        assert!(matches!(
+            alice.craft_message(b"one more"),
+            Err(CryptoError::NonceExhausted)
+        ));
+        assert!(matches!(
+            bob.validate_message(&last),
+            Err(CryptoError::NonceExhausted)
+        ));
+    }
 
-        // However Alice signed the message with a nonce counter of 0
-        let result = bob_session.validate_message(&encrypted_message);
-        assert!(result.is_err());
+    #[test]
+    fn test_empty_message() {
+        let (mut alice, mut bob) = session_pair(0);
+        let encrypted = alice.craft_message(b"").unwrap();
+        assert_eq!(bob.validate_message(&encrypted).unwrap(), b"");
+    }
+
+    #[test]
+    fn test_session_ids_are_random() {
+        assert_ne!(gen_session_id(), gen_session_id());
     }
 
     #[test]
@@ -564,104 +840,14 @@ mod tests {
     }
 
     #[test]
-    fn test_nonce_increment() {
-        // Generate a session ID
-        let session_id = gen_session_id();
+    fn test_base_counter() {
+        let (mut alice, mut bob) = session_pair(42);
+        assert_eq!(alice.send_counter(), 42);
+        assert_eq!(bob.recv_counter(), 42);
 
-        // Create a nonce with an initial counter of 0
-        let mut nonce = create_nonce(&session_id, 0);
-
-        // Increment the counter in the nonce
-        let mut counter = u64::from_le_bytes(nonce[16..24].try_into().unwrap());
-        counter += 1;
-        nonce[16..24].copy_from_slice(&counter.to_le_bytes());
-
-        // Verify the incremented nonce
-        assert_eq!(&nonce[..16], &session_id[..]);
-        assert_eq!(u64::from_le_bytes(nonce[16..24].try_into().unwrap()), 1);
-    }
-
-    #[test]
-    fn test_nonce_increment_and_counter() {
-        // Generate keypairs
-        let kem_pair = pair::KEMPair::create();
-        let ds_pair = SignerPair::create();
-        let target_kem_pair = pair::KEMPair::create();
-        let target_ds_pair = SignerPair::create();
-
-        // Create base nonce with initial counter value
-        let initial_counter = 42;
-        let base_nonce = create_nonce(&gen_session_id(), initial_counter);
-
-        // Create a session
-        let (mut session, _) = MessageSession::new_initiator(
-            kem_pair,
-            ds_pair,
-            base_nonce,
-            &target_kem_pair.to_bytes().unwrap().0,
-            &target_ds_pair.to_bytes().unwrap().0,
-        )
-        .unwrap();
-
-        // Test initial counter value
-        let counter = session.get_counter();
-        assert_eq!(counter, initial_counter);
-
-        // Test increment_nonce
-        session.increment_nonce();
-        let new_counter = session.get_counter();
-        assert_eq!(new_counter, initial_counter + 1);
-    }
-
-    #[test]
-    fn test_counter_wraparound() {
-        // Generate keypairs
-        let kem_pair = pair::KEMPair::create();
-        let ds_pair = SignerPair::create();
-        let target_kem_pair = pair::KEMPair::create();
-        let target_ds_pair = SignerPair::create();
-
-        // Create base nonce with counter set to MAX_NONCE_COUNTER
-        let base_nonce = create_nonce(&gen_session_id(), MAX_NONCE_COUNTER);
-
-        // Create a session
-        let (mut session, _) = MessageSession::new_initiator(
-            kem_pair,
-            ds_pair,
-            base_nonce,
-            &target_kem_pair.to_bytes().unwrap().0,
-            &target_ds_pair.to_bytes().unwrap().0,
-        )
-        .unwrap();
-
-        // Test initial counter value
-        assert_eq!(session.get_counter(), MAX_NONCE_COUNTER);
-
-        // Test increment_nonce wraps around
-        session.increment_nonce();
-        assert_eq!(session.get_counter(), 0);
-    }
-
-    #[test]
-    fn test_shared_secret_consistency() {
-        // Create two KEM pairs
-        let alice_kem = pair::KEMPair::create();
-        let bob_kem = pair::KEMPair::create();
-
-        // Alice initiates (would normally be sent to Bob)
-        let pubkey = mlkem1024::PublicKey::from_bytes(&bob_kem.to_bytes().unwrap().0).unwrap();
-        let (alice_ss, ciphertext) = alice_kem.encapsulate(&pubkey);
-        let ciphertext_bytes = ct2b(&ciphertext).unwrap();
-
-        // Bob receives and decapsulates
-        let ciphertext_received = mlkem1024::Ciphertext::from_bytes(&ciphertext_bytes).unwrap();
-        let bob_ss = bob_kem.decapsulate(&ciphertext_received).unwrap();
-
-        // Convert both to byte arrays for comparison
-        let alice_ss_bytes = ss2b(&alice_ss);
-        let bob_ss_bytes = ss2b(&bob_ss);
-
-        // The shared secrets should be identical
-        assert_eq!(alice_ss_bytes, bob_ss_bytes);
+        bob.validate_message(&alice.craft_message(b"hi").unwrap())
+            .unwrap();
+        assert_eq!(alice.send_counter(), 43);
+        assert_eq!(bob.recv_counter(), 43);
     }
 }

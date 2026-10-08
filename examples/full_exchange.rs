@@ -1,42 +1,47 @@
 use pq_msg::{
-    exchange::pair::KEMPair, messaging::MessageSession, messaging::create_nonce,
-    messaging::gen_session_id, signatures::keypair::SignerPair,
+    exchange::{pair::KEMPair, prekey::SignedPrekey},
+    messaging::{MessageSession, create_nonce, gen_session_id},
+    signatures::keypair::{SignerPair, ViewOperations},
 };
 
 fn main() {
-    let alice_kem = KEMPair::create();
     let alice_signer = SignerPair::create();
+    let mut bob_signer = SignerPair::create();
 
-    let bob_kem = KEMPair::create();
-    let bob_signer = SignerPair::create();
+    // Bob creates a one-time prekey and signs its public part, which he shares with Alice
+    let bob_prekey = KEMPair::create();
+    let bob_signed_prekey = SignedPrekey::new(&mut bob_signer, &bob_prekey).unwrap();
 
-    // Create a base nonce with a new session id, and a counter of
+    // Create a base nonce with a new session id, and a counter of 0
     let base_nonce = create_nonce(&gen_session_id(), 0);
 
-    // Lets create the message session for Alice first
+    // Lets create the message session for Alice first. This checks that the prekey
+    // was signed by Bob.
     let (mut alice_session, ciphertext) = MessageSession::new_initiator(
-        alice_kem,
         alice_signer.clone(),
         base_nonce,
-        &bob_kem.to_bytes().unwrap().0,    // Bob's public KEM key
-        &bob_signer.to_bytes().unwrap().0, // Bob's public signer key
+        &bob_signed_prekey,
+        bob_signer.pub_key_bytes(), // Bob's public signer key
     )
     .unwrap();
 
     // Now for Bob it would look like this
     let mut bob_session = MessageSession::new_responder(
-        bob_kem,
+        &bob_prekey,
         bob_signer.clone(),
         base_nonce,
         &ciphertext,
-        &alice_signer.to_bytes().unwrap().0, // Alice's public signer key
+        alice_signer.pub_key_bytes(), // Alice's public signer key
     )
     .unwrap();
 
-    // Now both sessions contain a shared secret they use to encrypt and decrypt messages
-    // and a nonce that is incremented with each message sent or received.
+    // The prekey was one-time, so Bob deletes it now (dropping it wipes it from memory)
+    drop(bob_prekey);
 
-    // Alice creates a mesasge and prepares to send it to Bob
+    // Both sessions now hold one chain key per direction, derived from the shared secret.
+    // Every message gets its own key, and the chain moves forward after each one.
+
+    // Alice creates a message and prepares to send it to Bob
     let message = b"Hello, Bob! This is a secret message.";
     let encrypted_message = alice_session.craft_message(message).unwrap();
 

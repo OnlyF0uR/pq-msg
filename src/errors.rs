@@ -1,29 +1,26 @@
 use std::array::TryFromSliceError;
 
-use pqcrypto_falcon::ffi::PQCLEAN_FALCON1024_AVX2_CRYPTO_BYTES;
-
 pub type Result<T> = std::result::Result<T, CryptoError>;
 
 #[derive(Debug)]
 pub enum CryptoError {
     InvalidSignature,
-    UnknownVerificationError,
-    PQCryptoError(pqcrypto_traits::Error),
-    InvalidKeyLength(crypto_common::InvalidLength),
+    /// Key bytes failed to decode, or a public key does not belong to its secret key
+    InvalidKey,
     ChaCha20Poly1305EncryptionError(chacha20poly1305::Error),
     IncongruentLength(usize, usize),
-    FalconSignatureTooShort(usize),
-    SignatureVerificationFailed,
+    /// The session's message counter is used up; start a new session
+    NonceExhausted,
+    /// Serialized session has an unknown version or a malformed field
+    InvalidSession,
     TryFromSliceError(TryFromSliceError),
 }
 
 impl std::fmt::Display for CryptoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CryptoError::PQCryptoError(e) => e.fmt(f),
-            CryptoError::UnknownVerificationError => write!(f, "Unknown verification error"),
             CryptoError::InvalidSignature => write!(f, "Invalid signature"),
-            CryptoError::InvalidKeyLength(e) => e.fmt(f),
+            CryptoError::InvalidKey => write!(f, "Invalid key"),
             CryptoError::ChaCha20Poly1305EncryptionError(e) => e.fmt(f),
             CryptoError::IncongruentLength(expected, actual) => {
                 write!(
@@ -32,34 +29,16 @@ impl std::fmt::Display for CryptoError {
                     expected, actual
                 )
             }
-            CryptoError::SignatureVerificationFailed => {
-                write!(f, "Signature verification failed")
+            CryptoError::NonceExhausted => {
+                write!(f, "Nonce counter exhausted, start a new session")
             }
-            CryptoError::FalconSignatureTooShort(len) => {
-                write!(
-                    f,
-                    "Signature too short: expected at least {} bytes, got {}",
-                    PQCLEAN_FALCON1024_AVX2_CRYPTO_BYTES, len
-                )
-            }
+            CryptoError::InvalidSession => write!(f, "Invalid serialized session"),
             CryptoError::TryFromSliceError(e) => e.fmt(f),
         }
     }
 }
 
 impl std::error::Error for CryptoError {}
-
-impl From<pqcrypto_traits::Error> for CryptoError {
-    fn from(e: pqcrypto_traits::Error) -> Self {
-        CryptoError::PQCryptoError(e)
-    }
-}
-
-impl From<crypto_common::InvalidLength> for CryptoError {
-    fn from(e: crypto_common::InvalidLength) -> Self {
-        CryptoError::InvalidKeyLength(e)
-    }
-}
 
 impl From<chacha20poly1305::Error> for CryptoError {
     fn from(e: chacha20poly1305::Error) -> Self {
@@ -70,5 +49,36 @@ impl From<chacha20poly1305::Error> for CryptoError {
 impl From<TryFromSliceError> for CryptoError {
     fn from(e: TryFromSliceError) -> Self {
         CryptoError::TryFromSliceError(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_display() {
+        assert_eq!(
+            CryptoError::InvalidSignature.to_string(),
+            "Invalid signature"
+        );
+        assert_eq!(CryptoError::InvalidKey.to_string(), "Invalid key");
+        assert_eq!(
+            CryptoError::IncongruentLength(32, 31).to_string(),
+            "Incongruent length: expected 32, got 31"
+        );
+        assert_eq!(
+            CryptoError::NonceExhausted.to_string(),
+            "Nonce counter exhausted, start a new session"
+        );
+        assert_eq!(
+            CryptoError::InvalidSession.to_string(),
+            "Invalid serialized session"
+        );
+
+        let aead = chacha20poly1305::Error;
+        assert_eq!(CryptoError::from(aead).to_string(), aead.to_string());
+        let slice = <[u8; 2]>::try_from(&[0u8; 1][..]).unwrap_err();
+        assert_eq!(CryptoError::from(slice).to_string(), slice.to_string());
     }
 }

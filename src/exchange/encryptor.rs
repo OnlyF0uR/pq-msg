@@ -1,33 +1,34 @@
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
-use pqcrypto_mlkem::mlkem1024::SharedSecret;
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::Aead};
 
 use crate::errors::CryptoError;
 
-use super::pair::ss2b;
-
-/// An encryptor utilizing XChaCha20Poly1305 authenticated encryption with a Kyber shared secret
+/// An encryptor utilizing XChaCha20Poly1305 authenticated encryption
 ///
 /// This struct provides an interface for encrypting and decrypting data using
-/// a post-quantum shared secret established via ML-KEM (formerly Kyber).
-/// It uses XChaCha20Poly1305 for authenticated encryption with associated data (AEAD).
+/// a 32-byte symmetric key. It uses XChaCha20Poly1305 for authenticated
+/// encryption with associated data (AEAD). The key is wiped from memory on drop.
+///
+/// Derive the key with a KDF (as `MessageSession` does) rather than using a raw
+/// KEM shared secret, and never let two parties encrypt under the same key.
 pub struct Encryptor {
-    /// The ML-KEM shared secret used to derive the encryption key
-    shared_secret: SharedSecret,
+    cipher: XChaCha20Poly1305,
 }
 
 impl Encryptor {
-    /// Creates a new encryptor with the given shared secret
+    /// Creates a new encryptor with the given key
     ///
     /// # Arguments
-    /// * `shared_secret` - The ML-KEM shared secret to use for encryption/decryption
+    /// * `key` - The 32-byte key to use for encryption/decryption
     ///
     /// # Returns
-    /// A new Encryptor instance initialized with the provided shared secret
-    pub fn new(shared_secret: SharedSecret) -> Self {
-        Self { shared_secret }
+    /// A new Encryptor instance initialized with the provided key
+    pub fn new(key: &[u8; 32]) -> Self {
+        Self {
+            cipher: XChaCha20Poly1305::new(key.into()),
+        }
     }
 
-    /// Encrypts plaintext using XChaCha20Poly1305 with the stored shared secret
+    /// Encrypts plaintext using XChaCha20Poly1305 with the stored key
     ///
     /// # Arguments
     /// * `plaintext` - The data to encrypt
@@ -40,15 +41,10 @@ impl Encryptor {
     /// - The nonce must never be reused with the same key
     /// - The ciphertext includes an authentication tag to verify integrity
     pub fn encrypt(&self, plaintext: &[u8], nonce: &[u8; 24]) -> Result<Vec<u8>, CryptoError> {
-        let ss = ss2b(&self.shared_secret);
-        let cipher = XChaCha20Poly1305::new_from_slice(&ss)?;
-        let nonce = XNonce::from_slice(nonce);
-
-        let ciphertext = cipher.encrypt(nonce, plaintext)?;
-        Ok(ciphertext)
+        Ok(self.cipher.encrypt(nonce.into(), plaintext)?)
     }
 
-    /// Decrypts ciphertext using XChaCha20Poly1305 with the stored shared secret
+    /// Decrypts ciphertext using XChaCha20Poly1305 with the stored key
     ///
     /// # Arguments
     /// * `ciphertext` - The encrypted data to decrypt
@@ -61,32 +57,28 @@ impl Encryptor {
     /// - This function will return an error if the ciphertext has been tampered with
     /// - The same nonce used for encryption must be provided for decryption
     pub fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; 24]) -> Result<Vec<u8>, CryptoError> {
-        let ss = ss2b(&self.shared_secret);
-        let cipher = XChaCha20Poly1305::new_from_slice(&ss)?;
-        let nonce = XNonce::from_slice(nonce);
-
-        Ok(cipher.decrypt(nonce, ciphertext)?)
+        Ok(self.cipher.decrypt(nonce.into(), ciphertext)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::pair::b2ss;
 
     #[test]
     fn test_encryption_decryption() {
-        let mock_ss_bytes = [0u8; 32];
-        let shared_secret = b2ss(&mock_ss_bytes);
-
-        let encryptor = Encryptor::new(shared_secret);
+        let encryptor = Encryptor::new(&[7u8; 32]);
 
         let plaintext = b"Hello, world!";
         let nonce = b"the length of this is 24";
 
-        let ciphertext = encryptor.encrypt(plaintext, nonce).unwrap();
+        let mut ciphertext = encryptor.encrypt(plaintext, nonce).unwrap();
         let decrypted_plaintext = encryptor.decrypt(&ciphertext, nonce).unwrap();
 
         assert_eq!(plaintext.to_vec(), decrypted_plaintext);
+
+        // Tampering is detected
+        ciphertext[0] ^= 1;
+        assert!(encryptor.decrypt(&ciphertext, nonce).is_err());
     }
 }
